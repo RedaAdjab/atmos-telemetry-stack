@@ -3,3 +3,5 @@
 __pycache__/
 *.py[cod]
 gateway-packets.jsonl
+backups/
+spool/

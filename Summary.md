@@ -108,6 +108,7 @@ The final `up` identifies an uplink event travelling from a device toward the ap
  
 - `on_connect()`: subscribes only after the broker accepts the connection.
 - `on_message()`: decodes each received MQTT payload and writes valid telemetry.
+- MQTT reconnects automatically after a disconnect, with a bounded reconnect delay.
  
 `loop_forever()` maintains the MQTT network loop. It receives packets, services keepalive traffic, and dispatches callbacks. The bridge remains a long-running ingestion process until it is stopped or an unrecoverable process-level failure occurs.
  
@@ -179,12 +180,18 @@ For every MQTT message, `on_message()` performs this sequence:
 4. Extract `uplink_message.decoded_payload`.
 5. Convert each known field to a finite floating-point number.
 6. Build an InfluxDB point if at least one known numeric field exists.
-7. Write the point synchronously to the configured bucket.
-8. Log the device ID after a successful write.
+7. Use `uplink_message.received_at` as the point timestamp.
+8. Write the point synchronously with retry and exponential backoff; permanently failed points are spooled for replay.
+9. Log the device ID after a successful write.
  
 Messages are ignored when the device ID is missing, the decoded payload is not an object, or no recognized field contains a valid finite number. The bridge does not insert zeroes for missing fields. This preserves the distinction between a real zero measurement and an absent measurement.
  
 `as_number()` rejects values that cannot become numbers and values such as `NaN` or infinity. Each field is validated independently, so a packet with one valid value and several missing or malformed values can still be stored with the valid field only.
+
+The bridge also performs non-blocking quality checks after numeric validation.
+It keeps the raw point but increments `suspect_total` when all four fields are
+zero, and increments `out_of_range_total` for broad physical-limit violations
+or when gust is lower than wind speed.
  
 ### 5.3 Error handling and logging
  
@@ -202,9 +209,42 @@ Stored telemetry from <device-id>
  
 The bridge creates an `InfluxDBClient` with the configured URL, token, and organization, then obtains a synchronous write API. A successful `write_api.write()` call completes before the bridge logs `Stored telemetry`.
  
-This approach is simple and appropriate for the current low-volume sensor deployment. It also means a slow or unavailable InfluxDB write can block message callback processing. Higher-volume operation would justify batching, queues, retry policy, and explicit bridge health metrics, but those mechanisms are not part of the current implementation.
+This approach is simple and appropriate for the current low-volume sensor deployment. Failed writes are retried and then spooled so a short InfluxDB outage does not lose accepted uplinks. A `bridge_health` point is written every 60 seconds with connection, ingestion, rejection, write-failure, spool-depth, and data-quality counters. The bridge logs transition-based alerts for MQTT disconnects, stale telemetry, spool backlog, newly rejected packets, and newly detected quality issues. A process that is completely down cannot print its own alert; external observation of missing health points remains the appropriate way to detect that condition.
  
 The write API and InfluxDB client are closed in the `finally` block when the MQTT loop exits.
+
+### 5.5 Operational alerts
+
+The bridge writes a `bridge_health` point every 60 seconds and prints
+transition-based alerts to its normal log output. The current alerts cover:
+
+- MQTT disconnection.
+- Stale telemetry: no successfully stored point for the configured threshold.
+- A spool backlog that remains present for the configured threshold.
+- Newly rejected uplinks.
+- Newly detected quality issues.
+
+The default stale-data settings are:
+
+```text
+EXPECTED_INTERVAL_SECONDS = 120
+STALE_MISSED_CYCLES        = 3
+```
+
+Therefore, the default stale alert threshold is six minutes without a
+successfully stored telemetry point. `SPOOL_ALERT_SECONDS` defaults to five
+minutes. These values must be adjusted to the device's real production
+cadence; the nominal firmware transmit loop is not necessarily the actual
+LoRaWAN delivery cadence. Alerts can be viewed with:
+
+```text
+docker compose logs -f bridge
+```
+
+The alerts are deliberately log-based and do not modify Grafana dashboards.
+A completely stopped bridge cannot print its own alert, so missing
+`bridge_health` data remains the signal for an external monitor or a future
+Grafana alert.
  
 ## 6. InfluxDB Data Model
  
@@ -217,10 +257,16 @@ fields:      wind_speed       = <number, when present>
              wind_direction   = <number, when present>
              gust             = <number, when present>
              temperature      = <number, when present>
-time:        assigned by InfluxDB at write time
+time:        TTN uplink_message.received_at
 ```
  
-The bridge deliberately supplies no device timestamp. InfluxDB therefore assigns the point timestamp when the bridge writes it. This timestamp represents the server-side ingestion time, which is suitable for the current pipeline but should be distinguished from the physical measurement time if buffering or long network delays are introduced later.
+The bridge supplies TTN's `uplink_message.received_at`, so replaying a spooled point preserves the time at which TTN received the uplink rather than moving it to the replay time.
+
+Quality checks do not reject raw telemetry. All-zero samples increment
+`suspect_total`; broad physical-limit violations and gust values below wind
+speed increment `out_of_range_total`. Thresholds are intentionally broad and
+are reported through `bridge_health` and bridge logs rather than changing
+existing Grafana panels.
  
 `device_id` is stored as a tag because it is metadata used for filtering and grouping. Sensor values remain fields because they change frequently and should not create high-cardinality tag values.
  
@@ -449,16 +495,15 @@ The system is end-to-end correct only when these representations agree. A radio 
  
 The current project is a working local/containerized telemetry deployment. It provides persistent database and Grafana state, TLS MQTT transport, startup ordering for InfluxDB-dependent services, numeric validation, and clear logging at the ingestion boundary.
  
-The current implementation does not store bridge-health metrics such as connection state, messages rejected, write failures, or time since last uplink. It also does not define a repository-backed dashboard JSON, an automated InfluxDB backup, a retention policy, or a retry queue around synchronous writes.
+The implementation now stores bridge-health counters, retries and spools failed writes, provisions a dashboard JSON, and provides manual backup plus restore verification scripts. The raw bucket is configured for 90-day retention on first initialization.
  
 For a larger or unattended deployment, the natural next additions are:
  
-- Store bridge health and ingestion counters in a separate measurement.
-- Add automated tests for payload extraction, numeric validation, and point construction.
-- Add explicit retry/backoff behavior for temporary MQTT and InfluxDB failures.
-- Export and version Grafana dashboards as provisioning files.
-- Define tested InfluxDB and Grafana backup/restore procedures.
-- Define retention rules for raw telemetry.
+- Add a downsampling policy for long-term aggregates.
+- Add alerts and external/off-site backup storage.
+- Add TTN backfill support for outages longer than the local spool window.
+- Add externally evaluated alerts for missing `bridge_health` points when the
+  bridge process itself is down.
 - Protect remote Grafana access with HTTPS, authentication, and a VPN or reverse proxy.
  
 The most important software boundary remains the payload contract: the firmware scale, TTN decoder names, MQTT topic, InfluxDB schema, and Grafana query must evolve together.

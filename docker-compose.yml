@@ -4,7 +4,7 @@ services:
     container_name: atmos-influxdb
     restart: unless-stopped
     ports:
-      - "8086:8086"
+      - "127.0.0.1:8086:8086"
     environment:
       DOCKER_INFLUXDB_INIT_MODE: setup
       DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUXDB_USERNAME}
@@ -12,9 +12,11 @@ services:
       DOCKER_INFLUXDB_INIT_ORG: ${INFLUXDB_ORG}
       DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUXDB_BUCKET}
       DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_TOKEN}
+      DOCKER_INFLUXDB_INIT_RETENTION: ${INFLUXDB_RETENTION:-90d}
     volumes:
       - influxdb_data:/var/lib/influxdb2
       - influxdb_config:/etc/influxdb2
+      - ./backups:/backups
     healthcheck:
       test: ["CMD", "influx", "ping"]
       interval: 10s
@@ -26,7 +28,7 @@ services:
     container_name: atmos-grafana
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
@@ -57,6 +59,12 @@ services:
       INFLUXDB_BUCKET: ${INFLUXDB_BUCKET}
       INFLUXDB_TOKEN: ${INFLUXDB_TOKEN}
       LOG_LEVEL: ${LOG_LEVEL}
+      EXPECTED_INTERVAL_SECONDS: ${EXPECTED_INTERVAL_SECONDS:-120}
+      STALE_MISSED_CYCLES: ${STALE_MISSED_CYCLES:-3}
+      SPOOL_ALERT_SECONDS: ${SPOOL_ALERT_SECONDS:-300}
+      SPOOL_PATH: /var/lib/ttn-bridge/failed-points.jsonl
+    volumes:
+      - ./spool:/var/lib/ttn-bridge
     depends_on:
       influxdb:
         condition: service_healthy

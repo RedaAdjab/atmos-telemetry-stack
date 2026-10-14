@@ -19,6 +19,18 @@ The bridge expects TTN `decoded_payload` to contain these numeric fields:
 
 These names match the decoder in the project request. They are intentionally different from the older reference documents.
 
+The bridge stores TTN's `uplink_message.received_at` as the point timestamp. If
+InfluxDB is temporarily unavailable, points are retried with exponential
+backoff and then appended to `spool/failed-points.jsonl` for replay.
+
+The bridge also prints small operational alerts to its normal log output
+(`docker compose logs -f bridge`): MQTT disconnects, stale telemetry, a spool
+backlog, newly rejected uplinks, and newly detected quality issues. Alerts are
+transition-based rather than printed every minute. Raw telemetry is never
+discarded for quality issues. All-zero samples, broad physical range
+violations, and gust values below wind speed are counted in `bridge_health` as
+`suspect_total` or `out_of_range_total`.
+
 ## First setup on Windows
 
 1. Copy the environment template:
@@ -70,6 +82,13 @@ With the environment active, validate the bridge with:
 python -m py_compile .\ttn_bridge.py
 ```
 
+Run the focused test suite with:
+
+```powershell
+pip install -r requirements-dev.txt
+python -m pytest .\tests -q
+```
+
 To run the bridge directly, set `INFLUX_URL=http://localhost:8086` in `.env`, start only InfluxDB and Grafana with Docker, and run:
 
 ```powershell
@@ -113,6 +132,8 @@ packets by default so the gateway does not repeatedly retry them; use
 ## Important settings
 
 - Use `TTN_PORT=8883` for TLS. The bridge verifies the broker certificate on this port.
+- Set `EXPECTED_INTERVAL_SECONDS` to the real device uplink cadence. The
+  default is 120 seconds, with an alert after three missed cycles.
 - The bridge connects to InfluxDB at `http://influxdb:8086` because both run in Docker.
 - Grafana also uses `http://influxdb:8086` through the Docker network.
 - The browser uses `localhost` because the ports are published on Windows.
@@ -138,6 +159,33 @@ packets by default so the gateway does not repeatedly retry them; use
 Do not use `docker compose down -v` unless deleting the local data is intentional.
 
 To back up a dashboard, open it in Grafana, choose **Dashboard settings** or **Share**, and use **Export** to save its JSON. This is an additional backup; normal `docker compose down` preserves the dashboard automatically.
+
+## Backups and restore verification
+
+The raw bucket is configured with a 90-day retention period on first
+initialization. Run the backup script manually (or schedule it via cron on the
+Pi; on Windows use Task Scheduler):
+
+```bash
+./backup.sh
+./restore-test.sh ./backups/20261014T220000Z
+```
+
+The script keeps the seven newest backup folders. The restore test imports a
+backup into a throwaway InfluxDB container and compares the total
+`wind_telemetry` field-value count with the live bucket. Backups are stored in
+the local `backups/` directory, which should itself be copied to separate
+storage.
+
+## Moving to a Raspberry Pi
+
+Copy the project (excluding `.venv`, `.env`, and any temporary files) to the
+Pi, install Docker Engine and the Compose plugin, then copy `.env.example` to
+`.env` and set the real credentials. Run `docker compose up -d` from the
+project directory and schedule `backup.sh` with cron. The bind-mounted
+`spool/` and `backups/` directories must remain writable by the Docker
+process. Keep Grafana and InfluxDB bound to `127.0.0.1` unless access is
+explicitly protected by a firewall or reverse proxy.
 
 ## Troubleshooting order
 
